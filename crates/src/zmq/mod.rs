@@ -1,0 +1,214 @@
+//! Drift ZMQ module
+
+use anchor_lang::Discriminator;
+use solana_sdk::{clock::Slot, commitment_config::CommitmentLevel, pubkey::Pubkey};
+pub mod message;
+pub mod zmq_subscriber;
+use yellowstone_grpc_proto::prelude::{Transaction, TransactionStatusMeta};
+pub use zmq_subscriber::{AccountFilter, ZmqConnectionOpts};
+
+use crate::{grpc::AccountUpdate, types::accounts::User};
+
+/// zmq transaction update callback
+pub type OnTransactionFn = dyn Fn(&TransactionUpdate) + Send + Sync + 'static;
+/// zmq oracle account update callback
+pub type OnOracleFn = dyn Fn(&AccountUpdate) + Send + Sync + 'static;
+/// zmq account update callback
+pub type OnAccountFn = dyn Fn(&AccountUpdate) + Send + Sync + 'static;
+/// zmq slot update callback
+pub type OnSlotFn = dyn Fn(Slot) + Send + Sync + 'static;
+
+/// Transaction update from ZMQ
+#[derive(Clone, Debug)]
+pub struct TransactionUpdate {
+    /// slot of the transaction
+    pub slot: u64,
+    /// true if this is a vote transaction
+    pub is_vote: bool,
+    pub transaction: Transaction,
+    pub meta: TransactionStatusMeta,
+}
+
+/// Config options for drift ZMQ subscription
+///
+/// ```example(no_run)
+///   // subscribe to all user and users stats accounts
+///   let opts = ZmqSubscribeOpts::default()
+///                .usermap_on() // subscribe to ALL user accounts
+///                .statsmap_on(); // subscribe to ALL user stats accounts
+///
+///  // cache specific user accounts only and set a new slot callback
+///  let first_3_subaccounts = (0_u16..3).into_iter().map(|i| wallet.sub_account(i)).collect();
+///  let opts = ZmqSubscribeOpts::default()
+///                 .user_accounts(first_3_subaccounts);
+///                 .on_slot(move |new_slot| {}) // slot callback
+/// ```
+///
+pub struct ZmqSubscribeOpts {
+    pub commitment: Option<CommitmentLevel>,
+    /// cache user account updates (default: false)
+    pub usermap: bool,
+    /// cache oracle account updates (default: true)
+    pub oraclemap: bool,
+    /// toggle user stats map
+    pub user_stats_map: bool,
+    /// list of user (sub)accounts to subscribe
+    pub user_accounts: Vec<Pubkey>,
+    /// callback for slot updates
+    pub on_slot: Option<Box<OnSlotFn>>,
+    /// custom callback for account updates
+    pub on_account: Option<Vec<(AccountFilter, Box<OnAccountFn>)>>,
+    /// custom callback for tx updates
+    pub on_transaction: Option<Box<OnTransactionFn>>,
+    /// custom callback for oracle account updates
+    pub on_oracle_update: Option<Box<OnOracleFn>>,
+    /// Network level connection config
+    pub connection_opts: ZmqConnectionOpts,
+    /// Enable inter-slot update notifications
+    pub interslot_updates: bool,
+    /// Watch transactions including these accounts
+    pub transaction_include_accounts: Vec<Pubkey>,
+}
+
+impl Default for ZmqSubscribeOpts {
+    fn default() -> Self {
+        Self {
+            commitment: Some(CommitmentLevel::Confirmed),
+            usermap: false,
+            user_stats_map: false,
+            oraclemap: true,
+            user_accounts: Default::default(),
+            transaction_include_accounts: Default::default(),
+            on_slot: None,
+            on_transaction: None,
+            on_account: None,
+            on_oracle_update: None,
+            connection_opts: ZmqConnectionOpts::default(),
+            interslot_updates: false,
+        }
+    }
+}
+
+impl ZmqSubscribeOpts {
+    /// Set the ZMQ subscription's commitment level (default: 'confirmed')
+    pub fn commitment(mut self, commitment: CommitmentLevel) -> Self {
+        self.commitment = Some(commitment);
+        self
+    }
+    /// Enables the subscription to receive updates for changes within a slot,  
+    /// not just at the beginning of new slots. default: false
+    pub fn interslot_updates_on(mut self) -> Self {
+        self.interslot_updates = true;
+        self
+    }
+    /// Cache ALL drift `User` account updates
+    ///
+    /// useful for e.g. building the DLOB, fast TX building for makers
+    ///
+    /// note: memory requirements ~2GiB
+    pub fn usermap_on(mut self) -> Self {
+        self.usermap = true;
+        self
+    }
+    /// Disable oraclemap, will not cache oracle account updates
+    pub fn oraclemap_off(mut self) -> Self {
+        self.oraclemap = false;
+        self
+    }
+    /// Cache ALL drift `UserStats` account updates
+    ///
+    /// useful for e.g. fast TX building for makers
+    pub fn statsmap_on(mut self) -> Self {
+        self.user_stats_map = true;
+        self
+    }
+    /// Cache ALL drift `UserStats` account updates
+    ///
+    /// useful for e.g. fast TX building for makers
+    pub fn statsmap_off(mut self) -> Self {
+        self.user_stats_map = false;
+        self
+    }
+    /// Cache account updates for given `users` only
+    pub fn user_accounts(mut self, users: Vec<Pubkey>) -> Self {
+        self.user_accounts = users;
+        self
+    }
+    /// Set a callback to invoke on new slot updates
+    ///
+    /// * `on_slot` - the callback for new slot updates
+    ///
+    /// ! `on_slot` must not block the ZMQ task
+    pub fn on_slot(mut self, on_slot: impl Fn(Slot) + Send + Sync + 'static) -> Self {
+        self.on_slot = Some(Box::new(on_slot));
+        self
+    }
+    /// Register a custom callback for account updates
+    ///
+    /// * `filter` - accounts matching filter will invoke the callback
+    /// * `callback` - fn to invoke on matching account update
+    ///
+    /// ! `callback` must not block the ZMQ task
+    pub fn on_account(
+        mut self,
+        filter: AccountFilter,
+        callback: impl Fn(&AccountUpdate) + Send + Sync + 'static,
+    ) -> Self {
+        match &mut self.on_account {
+            Some(on_account) => {
+                on_account.push((filter, Box::new(callback)));
+            }
+            None => {
+                self.on_account = Some(vec![(filter, Box::new(callback))]);
+            }
+        }
+        self
+    }
+    /// Register a custom callback for User account updates
+    ///
+    /// * `callback` - fn to invoke on all User account update
+    ///
+    /// ! `callback` must not block the ZMQ task
+    pub fn on_user_account(
+        self,
+        callback: impl Fn(&AccountUpdate) + Send + Sync + 'static,
+    ) -> Self {
+        let filter = AccountFilter::partial().with_discriminator(User::DISCRIMINATOR);
+        self.on_account(filter, callback)
+    }
+    /// Register a custom callback for oracle account updates
+    /// It will be called _before_ the oraclemap is updated
+    ///
+    /// * `callback` - fn to invoke on matching account update
+    ///
+    /// ! `callback` must not block the ZMQ task
+    pub fn on_oracle_update(
+        mut self,
+        callback: impl Fn(&AccountUpdate) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_oracle_update = Some(Box::new(callback));
+        self
+    }
+    /// Set network level connection opts
+    pub fn connection_opts(mut self, opts: ZmqConnectionOpts) -> Self {
+        self.connection_opts = opts;
+        self
+    }
+    /// Subscribe to transactions including `accounts`
+    pub fn transaction_include_accounts(mut self, accounts: Vec<Pubkey>) -> Self {
+        self.transaction_include_accounts = accounts;
+        self
+    }
+    /// Register a custom callback for transaction updates
+    ///
+    /// * `callback` - fn to invoke on matching account update
+    ///
+    /// ! `callback` must not block the ZMQ task
+    pub fn on_transaction(
+        mut self,
+        callback: impl Fn(&TransactionUpdate) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_transaction = Some(Box::new(callback));
+        self
+    }
+}

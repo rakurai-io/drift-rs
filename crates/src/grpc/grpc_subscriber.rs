@@ -402,7 +402,11 @@ impl DriftGrpcClient {
 
                                 for (filter, hook) in &on_account {
                                     if filter.matches(&pubkey, account) {
-                                        hook(&update);
+                                        if pubkey.to_string()
+                                            == "BrRpSaQ6hFDw8darPCyP9Sw7sjydMFQqB4ECAotXSEci"
+                                        {
+                                            hook(&update);
+                                        }
                                     }
                                 }
                             }

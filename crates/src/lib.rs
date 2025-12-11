@@ -52,6 +52,7 @@ use crate::{
         AccountUpdate, DataAndSlot, MarketType, *,
     },
     utils::{get_http_url, get_ws_url},
+    zmq::{zmq_subscriber::DriftZmqClient, AccountFilter as ZmqAccountFilter, ZmqSubscribeOpts},
 };
 pub use crate::{grpc::GrpcSubscribeOpts, types::Context, wallet::Wallet};
 
@@ -73,6 +74,7 @@ pub mod types;
 pub mod grpc;
 pub mod polled_account_subscriber;
 pub mod websocket_account_subscriber;
+pub mod zmq;
 
 pub mod websocket_program_account_subscriber;
 
@@ -993,6 +995,23 @@ impl DriftClient {
         self.backend.grpc_unsubscribe();
     }
 
+    pub async fn zmq_subscribe(
+        &self,
+        account_endpoint: String,
+        slot_endpoint: String,
+        opts: ZmqSubscribeOpts,
+        sync: bool,
+    ) -> SdkResult<()> {
+        self.backend
+            .zmq_subscribe(account_endpoint, slot_endpoint, opts, sync)
+            .await
+    }
+
+    /// Unsubscribe the ZMQ connection
+    pub fn zmq_unsubscribe(&self) {
+        self.backend.zmq_unsubscribe();
+    }
+
     /// Return a reference to the internal backend
     #[cfg(feature = "unsafe_pub")]
     pub fn backend(&self) -> &'static DriftClientBackend {
@@ -1012,6 +1031,7 @@ pub struct DriftClientBackend {
     spot_market_map: MarketMap<SpotMarket>,
     oracle_map: OracleMap,
     grpc_unsub: RwLock<Option<(UnsubHandle, UnsubHandle)>>,
+    zmq_unsub: RwLock<Option<UnsubHandle>>,
 }
 impl DriftClientBackend {
     /// Initialize a new `DriftClientBackend`
@@ -1092,6 +1112,7 @@ impl DriftClientBackend {
             spot_market_map,
             oracle_map,
             grpc_unsub: RwLock::default(),
+            zmq_unsub: RwLock::default(),
         })
     }
 
@@ -1332,6 +1353,133 @@ impl DriftClientBackend {
         if let Some((a, b)) = guard.take() {
             let _ = a.send(());
             let _ = b.send(());
+        }
+    }
+
+    /// Subscribe to all: markets, oracles, and slot updates over ZMQ
+    async fn zmq_subscribe(
+        &self,
+        account_endpoint: String,
+        slot_endpoint: String,
+        opts: ZmqSubscribeOpts,
+        sync: bool,
+    ) -> SdkResult<()> {
+        log::debug!(target: "zmq", "subscribing to zmq with endpoints: account={account_endpoint}, slot={slot_endpoint}");
+        let mut zmq = DriftZmqClient::new(account_endpoint.clone(), slot_endpoint.clone())
+            .zmq_connection_opts(opts.connection_opts.clone());
+
+        if sync {
+            // the DriftClientBackend syncs marketmaps by default
+            if self.perp_market_map.len() == 0 {
+                self.perp_market_map.sync(&self.rpc_client).await?;
+            }
+            if self.spot_market_map.len() == 0 {
+                self.spot_market_map.sync(&self.rpc_client).await?;
+            }
+            let spot_markets = self
+                .spot_market_map
+                .marketmap
+                .iter()
+                .map(|i| MarketId::spot(*i.key()));
+            let perp_markets = self
+                .perp_market_map
+                .marketmap
+                .iter()
+                .map(|i| MarketId::perp(*i.key()));
+            let all_markets: Vec<MarketId> = spot_markets.chain(perp_markets).collect();
+
+            self.oracle_map
+                .sync(all_markets.as_ref(), &self.rpc_client)
+                .await?;
+        }
+
+        zmq.on_account(
+            ZmqAccountFilter::partial().with_discriminator(SpotMarket::DISCRIMINATOR),
+            self.spot_market_map.on_account_fn(),
+        );
+        zmq.on_account(
+            ZmqAccountFilter::partial().with_discriminator(PerpMarket::DISCRIMINATOR),
+            self.perp_market_map.on_account_fn(),
+        );
+
+        if opts.user_stats_map {
+            zmq.on_account(
+                ZmqAccountFilter::partial().with_discriminator(UserStats::DISCRIMINATOR),
+                self.account_map.on_account_fn(),
+            );
+        }
+
+        // TODO: enable transaction callbacks for ZMQ
+        // let transactions_accounts_include = opts
+        //     .transaction_include_accounts
+        //     .iter()
+        //     .map(|a| a.to_string())
+        //     .collect();
+        // if let Some(f) = opts.on_transaction {
+        //     zmq.on_transaction(f);
+        // }
+
+        // set custom callbacks
+        if let Some(callbacks) = opts.on_account {
+            for (filter, on_account) in callbacks {
+                zmq.on_account(filter, on_account)
+            }
+        }
+
+        if let Some(f) = opts.on_slot {
+            zmq.on_slot(f);
+        }
+
+        if opts.usermap {
+            zmq.on_account(
+                ZmqAccountFilter::partial().with_discriminator(User::DISCRIMINATOR),
+                self.account_map.on_account_fn(),
+            );
+        } else {
+            // when usermap is on, the custom accounts are already included
+            // usermap off: subscribe to custom `User` accounts
+            zmq.on_account(
+                ZmqAccountFilter::full()
+                    .with_discriminator(User::DISCRIMINATOR)
+                    .with_accounts(opts.user_accounts.into_iter()),
+                self.account_map.on_account_fn(),
+            );
+        }
+
+        if opts.user_stats_map {
+            zmq.on_account(
+                ZmqAccountFilter::partial().with_discriminator(UserStats::DISCRIMINATOR),
+                self.account_map.on_account_fn(),
+            );
+        }
+
+        if let Some(on_oracle) = opts.on_oracle_update {
+            zmq.on_account(ZmqAccountFilter::firehose(), on_oracle);
+        }
+
+        if opts.oraclemap {
+            zmq.on_account(
+                ZmqAccountFilter::firehose(),
+                self.oracle_map.on_account_fn(),
+            );
+        }
+
+        let zmq_unsub = zmq
+            .subscribe()
+            .await
+            .map_err(|err| SdkError::Grpc(Box::new(err)))?;
+
+        let mut unsub = self.zmq_unsub.write().unwrap();
+        let _ = unsub.insert(zmq_unsub);
+
+        Ok(())
+    }
+
+    /// Unsubscribe the ZMQ connection
+    fn zmq_unsubscribe(&self) {
+        let mut guard = self.zmq_unsub.write().unwrap();
+        if let Some(unsub) = guard.take() {
+            let _ = unsub.send(());
         }
     }
 
@@ -3251,6 +3399,7 @@ mod tests {
                 CommitmentConfig::processed(),
             ),
             grpc_unsub: Default::default(),
+            zmq_unsub: Default::default(),
         };
 
         DriftClient {

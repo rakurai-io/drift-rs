@@ -391,13 +391,17 @@ impl OracleMap {
         let oraclemap = self.map();
         let oracle_lookup = self.shared_oracles.clone();
 
-        move |update: &GrpcAccountUpdate| match oracle_lookup.get(&update.pubkey).unwrap() {
-            OracleShareMode::Normal { source } => {
-                update_handler_grpc(update, *source, &oraclemap);
-            }
-            OracleShareMode::Mixed { sources } => {
-                for source in sources {
-                    update_handler_grpc(update, *source, &oraclemap);
+        move |update: &GrpcAccountUpdate| {
+            if let Some(m) = oracle_lookup.get(&update.pubkey) {
+                match m {
+                    OracleShareMode::Normal { source } => {
+                        update_handler_grpc(update, *source, &oraclemap);
+                    }
+                    OracleShareMode::Mixed { sources } => {
+                        for source in sources {
+                            update_handler_grpc(update, *source, &oraclemap);
+                        }
+                    }
                 }
             }
         }

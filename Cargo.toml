@@ -53,6 +53,8 @@ tokio-stream = "0.1.17"
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", branch = "master" }
 yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", branch = "master" }
+zmq = "0.10"
+bincode = "1.3"
 
 drift-pubsub-client = { version = "0.1.1", path = "crates/pubsub-client" }
 
