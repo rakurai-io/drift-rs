@@ -31,7 +31,7 @@ use crate::{
     memcmp::get_market_filter,
     types::{MapOf, EMPTY_ACCOUNT_CALLBACK},
     websocket_account_subscriber::WebsocketAccountSubscriber,
-    DataAndSlot, MarketId, MarketType, PerpMarket, SdkResult, SpotMarket, UnsubHandle,
+    DataAndSlot, MarketId, MarketType, PerpMarket, SdkError, SdkResult, SpotMarket, UnsubHandle,
 };
 
 const LOG_TARGET: &str = "marketmap";
@@ -82,7 +82,7 @@ pub struct MarketMap<T: AnchorDeserialize + Send> {
     pub marketmap: Arc<DashMap<u16, DataAndSlot<T>, ahash::RandomState>>,
     subscriptions: DashMap<u16, UnsubHandle, ahash::RandomState>,
     latest_slot: Arc<AtomicU64>,
-    pubsub: Arc<PubsubClient>,
+    pubsub: Option<Arc<PubsubClient>>,
     commitment: CommitmentConfig,
 }
 
@@ -92,7 +92,7 @@ where
 {
     pub const SUBSCRIPTION_ID: &'static str = "marketmap";
 
-    pub fn new(pubsub: Arc<PubsubClient>, commitment: CommitmentConfig) -> Self {
+    pub fn new(pubsub: Option<Arc<PubsubClient>>, commitment: CommitmentConfig) -> Self {
         Self {
             subscriptions: Default::default(),
             marketmap: Arc::default(),
@@ -147,6 +147,9 @@ where
     {
         log::debug!(target: LOG_TARGET, "subscribing: {:?}", T::MARKET_TYPE);
 
+        let pubsub = self.pubsub.as_ref()
+            .ok_or_else(|| SdkError::Generic("PubsubClient not available for subscription".into()))?;
+
         let markets = HashSet::<MarketId>::from_iter(markets.iter().copied());
         let mut pending_subscriptions =
             Vec::<(u16, WebsocketAccountSubscriber)>::with_capacity(markets.len());
@@ -160,7 +163,7 @@ where
                 MarketType::Spot => derive_spot_market_account(market.index()),
             };
             let market_subscriber = WebsocketAccountSubscriber::new(
-                Arc::clone(&self.pubsub),
+                Arc::clone(pubsub),
                 market_pubkey,
                 self.commitment,
             );
@@ -265,6 +268,21 @@ where
             T::MARKET_TYPE
         );
         let (markets, latest_slot) = get_market_accounts_with_fallback::<T>(rpc).await?;
+        self.sync_with_data(markets, latest_slot);
+        Ok(())
+    }
+
+    /// Sync market map with pre-fetched data (synchronous)
+    /// 
+    /// This method accepts pre-fetched market data and slot, allowing
+    /// the RPC thread to handle async data fetching separately.
+    /// Use this when you want to avoid async/await in your main logic.
+    pub fn sync_with_data(&self, markets: Vec<T>, latest_slot: u64) {
+        log::debug!(
+            target: LOG_TARGET,
+            "syncing marketmap with pre-fetched data: {:?}",
+            T::MARKET_TYPE
+        );
         for market in markets {
             self.marketmap.insert(
                 market.market_index(),
@@ -282,11 +300,18 @@ where
             T::MARKET_TYPE,
             self.marketmap.len()
         );
-        Ok(())
     }
 
     pub fn get_latest_slot(&self) -> u64 {
         self.latest_slot.load(Ordering::Relaxed)
+    }
+
+    /// Sync all market accounts synchronously (blocking)
+    /// 
+    /// This is a synchronous wrapper around the async sync method.
+    /// Use this when you don't have a tokio runtime available.
+    pub fn sync_blocking(&self, rpc: &RpcClient) -> SdkResult<()> {
+        futures::executor::block_on(self.sync(rpc))
     }
 }
 
@@ -438,11 +463,11 @@ mod tests {
     #[tokio::test]
     async fn marketmap_subscribe() {
         let map = MarketMap::<PerpMarket>::new(
-            Arc::new(
+            Some(Arc::new(
                 PubsubClient::new(&get_ws_url(&devnet_endpoint()).unwrap())
                     .await
                     .expect("ws connects"),
-            ),
+            )),
             CommitmentConfig::confirmed(),
         );
 

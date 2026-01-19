@@ -61,7 +61,7 @@ pub struct OracleMap {
     shared_oracles: ReadOnlyView<Pubkey, OracleShareMode, ahash::RandomState>,
     latest_slot: Arc<AtomicU64>,
     commitment: CommitmentConfig,
-    pubsub: Arc<PubsubClient>,
+    pubsub: Option<Arc<PubsubClient>>,
 }
 
 impl OracleMap {
@@ -69,12 +69,12 @@ impl OracleMap {
 
     /// Create a new `OracleMap`
     ///
-    /// * `rpc_client` - Shared RPC client instance
-    /// * `pubsub_client` - Shared Pubsub client instance
+    /// * `pubsub_client` - Optional shared Pubsub client instance (required only for subscriptions)
     /// * `all_oracles` - Exhaustive list of all Drift oracle pubkeys and source by market
+    /// * `commitment` - Commitment level for RPC calls
     ///
     pub fn new(
-        pubsub_client: Arc<PubsubClient>,
+        pubsub_client: Option<Arc<PubsubClient>>,
         all_oracles: &[(MarketId, Pubkey, OracleSource)],
         commitment: CommitmentConfig,
     ) -> Self {
@@ -151,6 +151,9 @@ impl OracleMap {
         let markets = HashSet::from_iter(markets);
         log::debug!(target: LOG_TARGET, "subscribe market oracles: {markets:?}");
 
+        let pubsub = self.pubsub.as_ref()
+            .ok_or_else(|| SdkError::Generic("PubsubClient not available for subscription".into()))?;
+
         let mut pending_subscriptions =
             Vec::<WebsocketAccountSubscriber>::with_capacity(markets.len());
 
@@ -172,7 +175,7 @@ impl OracleMap {
             }
 
             let oracle_subscriber = WebsocketAccountSubscriber::new(
-                Arc::clone(&self.pubsub),
+                Arc::clone(pubsub),
                 *oracle_pubkey,
                 self.commitment,
             );
@@ -278,11 +281,37 @@ impl OracleMap {
             return Err(SdkError::InvalidOracle);
         }
 
+        self.sync_with_data(&synced_oracles, &oracle_sources, latest_slot);
+
+        Ok(())
+    }
+
+    /// Sync oracle prices with pre-fetched data (synchronous)
+    /// 
+    /// This method accepts pre-fetched oracle account data and sources, allowing
+    /// the RPC thread to handle async data fetching separately.
+    /// Use this when you want to avoid async/await in your main logic.
+    /// 
+    /// * `synced_oracles` - Vector of (Pubkey, Account) tuples for oracle accounts
+    /// * `oracle_sources` - Vector of OracleSource matching the order of synced_oracles
+    /// * `latest_slot` - The slot at which the data was fetched
+    pub fn sync_with_data(
+        &self,
+        synced_oracles: &[(Pubkey, solana_sdk::account::Account)],
+        oracle_sources: &[OracleSource],
+        latest_slot: u64,
+    ) {
+        log::debug!(
+            target: LOG_TARGET,
+            "syncing oracle map with pre-fetched data: {} oracles",
+            synced_oracles.len()
+        );
+
         for ((oracle_pubkey, oracle_account), oracle_source) in
             synced_oracles.iter().zip(oracle_sources)
         {
             self.oraclemap
-                .entry((*oracle_pubkey, oracle_source as u8))
+                .entry((*oracle_pubkey, *oracle_source as u8))
                 .and_modify(|o| {
                     log::debug!(
                         target: LOG_TARGET,
@@ -291,7 +320,7 @@ impl OracleMap {
                         oracle_pubkey
                     );
                     let price_data = get_oracle_price(
-                        oracle_source,
+                        *oracle_source,
                         &mut (*oracle_pubkey, oracle_account.clone()),
                         latest_slot,
                     )
@@ -309,7 +338,7 @@ impl OracleMap {
                         oracle_pubkey
                     );
                     let price_data = get_oracle_price(
-                        oracle_source,
+                        *oracle_source,
                         &mut (*oracle_pubkey, oracle_account.clone()),
                         latest_slot,
                     )
@@ -319,7 +348,7 @@ impl OracleMap {
                         pubkey: *oracle_pubkey,
                         data: price_data,
                         slot: latest_slot,
-                        source: oracle_source,
+                        source: *oracle_source,
                         raw: oracle_account.data.clone(),
                     }
                 });
@@ -331,8 +360,14 @@ impl OracleMap {
             "synced {} oracles",
             synced_oracles.len()
         );
+    }
 
-        Ok(())
+    /// Sync oracle prices synchronously (blocking)
+    ///
+    /// This is a synchronous wrapper around the async sync method.
+    /// Use this when you don't have a tokio runtime available.
+    pub fn sync_blocking(&self, markets: &[MarketId], rpc: &RpcClient) -> SdkResult<()> {
+        futures::executor::block_on(self.sync(markets, rpc))
     }
 
     /// Number of oracles known to the `OracleMap`
@@ -503,7 +538,7 @@ fn update_handler(
 ///    getMultipleAccounts, lastly multiple getAccountInfo
 ///
 /// Returns deserialized accounts and retrieved slot
-async fn get_multi_account_data_with_fallback(
+pub async fn get_multi_account_data_with_fallback(
     rpc: &RpcClient,
     pubkeys: &[Pubkey],
 ) -> SdkResult<(Vec<(Pubkey, Account)>, Slot)> {
@@ -620,7 +655,7 @@ mod tests {
                 .await
                 .expect("ws connects"),
         );
-        let map = OracleMap::new(pubsub, &all_oracles, rpc.commitment());
+        let map = OracleMap::new(Some(pubsub), &all_oracles, rpc.commitment());
 
         // - dups ignored
         // - markets with same oracle pubkey, make at most 1 sub
@@ -659,7 +694,7 @@ mod tests {
                 .await
                 .expect("ws connects"),
         );
-        let map = OracleMap::new(pubsub, &all_oracles, CommitmentConfig::confirmed());
+        let map = OracleMap::new(Some(pubsub), &all_oracles, CommitmentConfig::confirmed());
 
         let markets = [MarketId::perp(0), MarketId::spot(32), MarketId::perp(4)];
         map.subscribe(&markets).await.expect("subd");
@@ -690,7 +725,7 @@ mod tests {
                 .await
                 .expect("ws connects"),
         );
-        let map = OracleMap::new(pubsub, &all_oracles, CommitmentConfig::confirmed());
+        let map = OracleMap::new(Some(pubsub), &all_oracles, CommitmentConfig::confirmed());
 
         // - dups ignored
         // - markets with same oracle pubkey, make at most 1 sub
@@ -729,11 +764,11 @@ mod tests {
             ),
         ];
         let map = OracleMap::new(
-            Arc::new(
+            Some(Arc::new(
                 PubsubClient::new(&get_ws_url(&devnet_endpoint()).unwrap())
                     .await
                     .expect("ws connects"),
-            ),
+            )),
             &all_oracles,
             CommitmentConfig::confirmed(),
         );

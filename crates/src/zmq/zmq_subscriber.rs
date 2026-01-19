@@ -164,7 +164,7 @@ impl DriftZmqClient {
             zmq_opts: None,
             on_slot: Box::new(move |_slot| {}),
         }
-    }
+    }//call this
 
     /// Set ZMQ network options
     pub fn zmq_connection_opts(mut self, zmq_opts: ZmqConnectionOpts) -> Self {

@@ -48,7 +48,7 @@ use crate::{
     oraclemap::{Oracle, OracleMap},
     swift_order_subscriber::{SignedOrderInfo, SwiftOrderStream},
     types::{
-        accounts::{PerpMarket, SpotMarket, State, User, UserStats},
+        accounts::{HighLeverageModeConfig, PerpMarket, SpotMarket, State, User, UserStats},
         AccountUpdate, DataAndSlot, MarketType, *,
     },
     utils::{get_http_url, get_ws_url},
@@ -270,6 +270,14 @@ impl DriftClient {
         self.backend
             .subscribe_oracles_with_callback(&markets, on_account)
             .await
+    }
+
+    /// Sync oracle prices for the given markets
+    ///
+    /// This fetches current oracle prices via RPC and populates the oracle cache.
+    /// This is required for DLOB to work correctly, as it needs oracle prices to update L2 views.
+    pub async fn sync_oracles(&self, markets: &[MarketId]) -> SdkResult<()> {
+        self.backend.sync_oracles(markets).await
     }
 
     /// Subscribe to all spot market oracles
@@ -1040,25 +1048,17 @@ impl DriftClientBackend {
             Arc::new(PubsubClient::new(&get_ws_url(rpc_client.url().as_str())?).await?);
 
         let perp_market_map =
-            MarketMap::<PerpMarket>::new(Arc::clone(&pubsub_client), rpc_client.commitment());
+            MarketMap::<PerpMarket>::new(Some(Arc::clone(&pubsub_client)), rpc_client.commitment());
         let spot_market_map =
-            MarketMap::<SpotMarket>::new(Arc::clone(&pubsub_client), rpc_client.commitment());
+            MarketMap::<SpotMarket>::new(Some(Arc::clone(&pubsub_client)), rpc_client.commitment());
 
         let lut_pubkeys = context.luts();
 
         let account_map = AccountMap::new(
-            Arc::clone(&pubsub_client),
-            Arc::clone(&rpc_client),
+            Some(Arc::clone(&pubsub_client)),
+            Some(Arc::clone(&rpc_client)),
             rpc_client.commitment(),
         );
-
-        tokio::try_join!(
-            account_map.subscribe_account_polled(state_account(), Some(Duration::from_secs(180))),
-            account_map.subscribe_account_polled(
-                high_leverage_mode_account(),
-                Some(Duration::from_secs(180))
-            )
-        )?;
 
         let (_, _, lut_accounts, state_account_data) = tokio::try_join!(
             perp_market_map.sync(&rpc_client),
@@ -1092,7 +1092,7 @@ impl DriftClientBackend {
         }
 
         let oracle_map = OracleMap::new(
-            Arc::clone(&pubsub_client),
+            Some(Arc::clone(&pubsub_client)),
             all_oracles.as_slice(),
             rpc_client.commitment(),
         );
@@ -1364,6 +1364,7 @@ impl DriftClientBackend {
         opts: ZmqSubscribeOpts,
         sync: bool,
     ) -> SdkResult<()> {
+        println!("subscribing to zmq with endpoints: account={account_endpoint}, slot={slot_endpoint}");
         log::debug!(target: "zmq", "subscribing to zmq with endpoints: account={account_endpoint}, slot={slot_endpoint}");
         let mut zmq = DriftZmqClient::new(account_endpoint.clone(), slot_endpoint.clone())
             .zmq_connection_opts(opts.connection_opts.clone());
@@ -1400,6 +1401,14 @@ impl DriftClientBackend {
         zmq.on_account(
             ZmqAccountFilter::partial().with_discriminator(PerpMarket::DISCRIMINATOR),
             self.perp_market_map.on_account_fn(),
+        );
+        zmq.on_account(
+            ZmqAccountFilter::partial().with_discriminator(State::DISCRIMINATOR),
+            self.account_map.on_account_fn(),
+        );
+        zmq.on_account(
+            ZmqAccountFilter::partial().with_discriminator(HighLeverageModeConfig::DISCRIMINATOR),
+            self.account_map.on_account_fn(),
         );
 
         if opts.user_stats_map {
@@ -1532,6 +1541,11 @@ impl DriftClientBackend {
         }
 
         self.try_get_oracle_price_data_and_slot(market)
+    }
+
+    /// Sync oracle prices for the given markets
+    async fn sync_oracles(&self, markets: &[MarketId]) -> SdkResult<()> {
+        self.oracle_map.sync(markets, &self.rpc_client).await
     }
 
     /// Return a handle to the inner RPC client
@@ -3104,12 +3118,22 @@ impl<'a> TransactionBuilder<'a> {
             }
         });
 
+        // Pad or truncate name to exactly 32 bytes
+        let name_bytes = name.as_bytes();
+        let mut padded_name = [0u8; 32];
+        let copy_len = name_bytes.len().min(32);
+        padded_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+        // Fill remaining bytes with spaces if name was shorter than 32 bytes
+        if copy_len < 32 {
+            padded_name[copy_len..].fill(b' ');
+        }
+
         let ix = Instruction {
             program_id: constants::PROGRAM_ID,
             accounts,
             data: InstructionData::data(&drift_idl::instructions::InitializeUser {
                 sub_account_id,
-                name: name.as_bytes()[..32].try_into().unwrap(),
+                name: padded_name,
             }),
         };
 
@@ -3378,9 +3402,9 @@ mod tests {
         );
 
         let perp_market_map =
-            MarketMap::<PerpMarket>::new(Arc::clone(&pubsub_client), rpc_client.commitment());
+            MarketMap::<PerpMarket>::new(Some(Arc::clone(&pubsub_client)), rpc_client.commitment());
         let spot_market_map =
-            MarketMap::<SpotMarket>::new(Arc::clone(&pubsub_client), rpc_client.commitment());
+            MarketMap::<SpotMarket>::new(Some(Arc::clone(&pubsub_client)), rpc_client.commitment());
 
         let backend = DriftClientBackend {
             rpc_client: Arc::clone(&rpc_client),
@@ -3388,14 +3412,14 @@ mod tests {
             program_data: ProgramData::uninitialized(),
             perp_market_map,
             spot_market_map,
-            oracle_map: OracleMap::new(Arc::clone(&pubsub_client), &[], rpc_client.commitment()),
+            oracle_map: OracleMap::new(Some(Arc::clone(&pubsub_client)), &[], rpc_client.commitment()),
             blockhash_subscriber: BlockhashSubscriber::new(
                 Duration::from_secs(2),
                 Arc::clone(&rpc_client),
             ),
             account_map: AccountMap::new(
-                Arc::clone(&pubsub_client),
-                Arc::clone(&rpc_client),
+                Some(Arc::clone(&pubsub_client)),
+                Some(Arc::clone(&rpc_client)),
                 CommitmentConfig::processed(),
             ),
             grpc_unsub: Default::default(),

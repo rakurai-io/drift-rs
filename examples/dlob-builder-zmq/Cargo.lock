@@ -1436,6 +1436,7 @@ dependencies = [
  "drift-idl-gen",
  "drift-pubsub-client",
  "env_logger 0.11.8",
+ "futures",
  "futures-util",
  "hex",
  "jupiter-swap-api-client",

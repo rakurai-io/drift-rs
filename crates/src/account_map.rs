@@ -8,7 +8,7 @@ use std::{
 use bytemuck::Pod;
 use dashmap::DashMap;
 use drift_pubsub_client::PubsubClient;
-use log::debug;
+use log::{debug, warn};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{clock::Slot, commitment_config::CommitmentConfig, pubkey::Pubkey};
 
@@ -17,7 +17,7 @@ use crate::{
     polled_account_subscriber::PolledAccountSubscriber,
     types::{DataAndSlot, EMPTY_ACCOUNT_CALLBACK},
     websocket_account_subscriber::WebsocketAccountSubscriber,
-    SdkResult, UnsubHandle,
+    SdkError, SdkResult, UnsubHandle,
 };
 
 const LOG_TARGET: &str = "accountmap";
@@ -32,8 +32,8 @@ pub struct AccountSlot {
 ///
 /// Accounts are subscribed by either Ws or polling at fixed intervals
 pub struct AccountMap {
-    pubsub: Arc<PubsubClient>,
-    rpc: Arc<RpcClient>,
+    pubsub: Option<Arc<PubsubClient>>,
+    rpc: Option<Arc<RpcClient>>,
     commitment: CommitmentConfig,
     inner: Arc<DashMap<Pubkey, AccountSlot, ahash::RandomState>>,
     subscriptions: Arc<DashMap<Pubkey, AccountSub<Subscribed>, ahash::RandomState>>,
@@ -41,8 +41,8 @@ pub struct AccountMap {
 
 impl AccountMap {
     pub fn new(
-        pubsub: Arc<PubsubClient>,
-        rpc: Arc<RpcClient>,
+        pubsub: Option<Arc<PubsubClient>>,
+        rpc: Option<Arc<RpcClient>>,
         commitment: CommitmentConfig,
     ) -> Self {
         Self {
@@ -92,7 +92,9 @@ impl AccountMap {
         }
         debug!(target: LOG_TARGET, "subscribing: {account:?}");
 
-        let user = AccountSub::new(Arc::clone(&self.pubsub), self.commitment, *account);
+        let pubsub = self.pubsub.as_ref()
+            .ok_or_else(|| SdkError::Generic("PubsubClient not available for subscription".into()))?;
+        let user = AccountSub::new(Arc::clone(pubsub), self.commitment, *account);
         let sub = user.subscribe(Arc::clone(&self.inner), on_account).await?;
         self.subscriptions.insert(*account, sub);
 
@@ -149,7 +151,9 @@ impl AccountMap {
             "subscribing: {account:?} @ {interval:?}"
         );
 
-        let user = AccountSub::polled(Arc::clone(&self.rpc), *account, interval);
+        let rpc = self.rpc.as_ref()
+            .ok_or_else(|| SdkError::Generic("RpcClient not available for polling".into()))?;
+        let user = AccountSub::polled(Arc::clone(rpc), *account, interval);
         let sub = user.subscribe(Arc::clone(&self.inner), on_account).await?;
         self.subscriptions.insert(*account, sub);
 
@@ -161,6 +165,21 @@ impl AccountMap {
         let accounts = Arc::clone(&self.inner);
         let subscriptions = Arc::clone(&self.subscriptions);
         move |update| {
+            // Validate account data has at least 8 bytes (discriminator) before slicing
+            if update.data.len() < 8 {
+                warn!(
+                    target: LOG_TARGET,
+                    "Account data too small: expected at least 8 bytes, got {} bytes for account {}",
+                    update.data.len(),
+                    update.pubkey
+                );
+                // Remove account if data is invalid
+                if update.lamports == 0 {
+                    accounts.remove(&update.pubkey);
+                }
+                return;
+            }
+            
             accounts
                 .entry(update.pubkey)
                 .and_modify(|x| {
@@ -202,14 +221,44 @@ impl AccountMap {
     }
     /// Return data of the given `account` as T and slot, if it exists
     pub fn account_data_and_slot<T: Pod>(&self, account: &Pubkey) -> Option<DataAndSlot<T>> {
-        self.inner.get(account).map(|x| {
+        self.inner.get(account).and_then(|x| {
+            // Validate stored data size matches exactly (bytemuck requires exact size match)
+            let expected_size = std::mem::size_of::<T>();
+            if x.raw.len() != expected_size {
+                warn!(
+                    target: LOG_TARGET,
+                    "Stored account data size mismatch for type {}: expected exactly {} bytes, got {} bytes for account {}",
+                    std::any::type_name::<T>(),
+                    expected_size,
+                    x.raw.len(),
+                    account
+                );
+                return None;
+            }
+            
             let arc = x.raw.clone();
-            DataAndSlot {
-                slot: x.slot,
-                data: *AccountRef {
+            // Use catch_unwind to safely handle any panics from bytemuck deserialization
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                *AccountRef {
                     arc,
                     _marker: std::marker::PhantomData,
-                },
+                }
+            }));
+            
+            match result {
+                Ok(data) => Some(DataAndSlot {
+                    slot: x.slot,
+                    data,
+                }),
+                Err(_) => {
+                    warn!(
+                        target: LOG_TARGET,
+                        "Failed to deserialize account data for type {} from account {}",
+                        std::any::type_name::<T>(),
+                        account
+                    );
+                    None
+                }
             }
         })
     }
@@ -384,7 +433,7 @@ mod tests {
                 .expect("ws connects"),
         );
         let rpc = Arc::new(RpcClient::new(mainnet_endpoint()));
-        let account_map = AccountMap::new(pubsub, rpc, CommitmentConfig::confirmed());
+        let account_map = AccountMap::new(Some(pubsub), Some(rpc), CommitmentConfig::confirmed());
         let user_1 = Wallet::derive_user_account(
             &pubkey!("DxoRJ4f5XRMvXU9SGuM4ZziBFUxbhB3ubur5sVZEvue2"),
             0,
