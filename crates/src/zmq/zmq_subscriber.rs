@@ -465,9 +465,7 @@ impl DriftZmqClient {
                 };
                 for (filter, hook) in on_account {
                     if filter.matches(&pubkey, &account.data) {
-                        if pubkey.to_string() == "BrRpSaQ6hFDw8darPCyP9Sw7sjydMFQqB4ECAotXSEci" {
-                            hook(&grpc_update);
-                        }
+                        hook(&grpc_update);
                     }
                 }
             }
