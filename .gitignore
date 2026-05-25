@@ -6,4 +6,5 @@ target
 .vscode
 .env
 *.log
-examples/drift_transaction/src
+examples/transaction-perp
+examples/perp-market-pool-info
